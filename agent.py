@@ -1,0 +1,280 @@
+"""
+Computer / System Subagent
+Receives structured tasks from n8n, executes them, returns SUCCESS/FAILED/CONFIRMATION_REQUIRED.
+"""
+
+import os
+import subprocess
+import platform
+import psutil
+import shutil
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from typing import Any
+import uvicorn
+
+app = FastAPI(title="Computer System Subagent")
+
+# ---------------------------------------------------------------------------
+# Schema
+# ---------------------------------------------------------------------------
+
+class Task(BaseModel):
+    action: str          # e.g. "get_cpu", "run_command", "open_app", ...
+    params: dict[str, Any] = {}
+
+class Result(BaseModel):
+    status: str          # SUCCESS | FAILED | CONFIRMATION_REQUIRED
+    operation: str
+    result: Any = None
+    reason: str = None
+    risk: str = None
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def ok(operation: str, result: Any) -> dict:
+    return {"status": "SUCCESS", "operation": operation, "result": result}
+
+def fail(operation: str, reason: str) -> dict:
+    return {"status": "FAILED", "operation": operation, "reason": reason}
+
+def confirm(operation: str, risk: str) -> dict:
+    return {"status": "CONFIRMATION_REQUIRED", "operation": operation, "risk": risk}
+
+REDACT = {"password", "token", "secret", "key", "auth", "credential", "pass"}
+
+def redact(text: str) -> str:
+    """Scrub likely secrets from command output."""
+    lines = []
+    for line in text.splitlines():
+        low = line.lower()
+        if any(k in low for k in REDACT):
+            lines.append("[REDACTED]")
+        else:
+            lines.append(line)
+    return "\n".join(lines)
+
+# ---------------------------------------------------------------------------
+# Handlers
+# ---------------------------------------------------------------------------
+
+def handle_get_cpu(params):
+    return ok("get_cpu", {
+        "percent": psutil.cpu_percent(interval=1),
+        "count_logical": psutil.cpu_count(),
+        "count_physical": psutil.cpu_count(logical=False),
+        "freq_mhz": psutil.cpu_freq().current if psutil.cpu_freq() else None,
+    })
+
+def handle_get_ram(params):
+    vm = psutil.virtual_memory()
+    return ok("get_ram", {
+        "total_gb": round(vm.total / 1e9, 2),
+        "available_gb": round(vm.available / 1e9, 2),
+        "used_gb": round(vm.used / 1e9, 2),
+        "percent": vm.percent,
+    })
+
+def handle_get_disk(params):
+    path = params.get("path", "/")
+    try:
+        usage = psutil.disk_usage(path)
+        return ok("get_disk", {
+            "path": path,
+            "total_gb": round(usage.total / 1e9, 2),
+            "used_gb": round(usage.used / 1e9, 2),
+            "free_gb": round(usage.free / 1e9, 2),
+            "percent": usage.percent,
+        })
+    except Exception as e:
+        return fail("get_disk", str(e))
+
+def handle_get_system_info(params):
+    uname = platform.uname()
+    return ok("get_system_info", {
+        "os": uname.system,
+        "node": uname.node,
+        "release": uname.release,
+        "version": uname.version,
+        "machine": uname.machine,
+        "processor": uname.processor,
+        "python": platform.python_version(),
+    })
+
+def handle_list_processes(params):
+    name_filter = params.get("name_filter", "").lower()
+    procs = []
+    for p in psutil.process_iter(["pid", "name", "status", "cpu_percent", "memory_percent"]):
+        try:
+            info = p.info
+            if name_filter and name_filter not in info["name"].lower():
+                continue
+            procs.append(info)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+    return ok("list_processes", procs)
+
+def handle_kill_process(params):
+    pid = params.get("pid")
+    name = params.get("name")
+    if not pid and not name:
+        return fail("kill_process", "Provide pid or name")
+    # require explicit confirm flag
+    if not params.get("confirmed"):
+        target = f"PID {pid}" if pid else f"name={name}"
+        return confirm("kill_process", f"This will terminate process {target}. Resend with confirmed=true.")
+    try:
+        if pid:
+            psutil.Process(int(pid)).terminate()
+            return ok("kill_process", f"Terminated PID {pid}")
+        else:
+            killed = []
+            for p in psutil.process_iter(["pid", "name"]):
+                if p.info["name"].lower() == name.lower():
+                    p.terminate()
+                    killed.append(p.info["pid"])
+            return ok("kill_process", f"Terminated PIDs: {killed}")
+    except Exception as e:
+        return fail("kill_process", str(e))
+
+def handle_run_command(params):
+    command = params.get("command", "").strip()
+    if not command:
+        return fail("run_command", "No command provided")
+    # Blocklist
+    blocked = ["rm -rf", "format", "del /f", "shutdown", "mkfs", ":(){:|:&}", "dd if="]
+    for b in blocked:
+        if b in command.lower():
+            return fail("run_command", f"Blocked: '{b}' is not permitted")
+    # Destructive ops require confirmation
+    destructive = ["rmdir", "remove-item", "del ", "rd /"]
+    if any(d in command.lower() for d in destructive) and not params.get("confirmed"):
+        return confirm("run_command", f"Destructive command: '{command}'. Resend with confirmed=true.")
+    try:
+        result = subprocess.run(
+            command,
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=params.get("timeout", 30),
+        )
+        return ok("run_command", {
+            "stdout": redact(result.stdout.strip()),
+            "stderr": redact(result.stderr.strip()),
+            "returncode": result.returncode,
+        })
+    except subprocess.TimeoutExpired:
+        return fail("run_command", "Command timed out")
+    except Exception as e:
+        return fail("run_command", str(e))
+
+def handle_open_app(params):
+    path = params.get("path", "").strip()
+    if not path:
+        return fail("open_app", "No path provided")
+    try:
+        if platform.system() == "Windows":
+            os.startfile(path)
+        elif platform.system() == "Darwin":
+            subprocess.Popen(["open", path])
+        else:
+            subprocess.Popen(["xdg-open", path])
+        return ok("open_app", f"Launched: {path}")
+    except Exception as e:
+        return fail("open_app", str(e))
+
+def handle_list_directory(params):
+    path = params.get("path", ".")
+    try:
+        entries = []
+        for entry in os.scandir(path):
+            entries.append({
+                "name": entry.name,
+                "is_file": entry.is_file(),
+                "is_dir": entry.is_dir(),
+                "size_bytes": entry.stat().st_size if entry.is_file() else None,
+            })
+        return ok("list_directory", {"path": path, "entries": entries})
+    except Exception as e:
+        return fail("list_directory", str(e))
+
+def handle_read_file(params):
+    path = params.get("path", "")
+    if not path:
+        return fail("read_file", "No path provided")
+    max_bytes = params.get("max_bytes", 100_000)
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            content = f.read(max_bytes)
+        return ok("read_file", {"path": path, "content": redact(content)})
+    except Exception as e:
+        return fail("read_file", str(e))
+
+def handle_write_file(params):
+    path = params.get("path", "")
+    content = params.get("content", "")
+    if not path:
+        return fail("write_file", "No path provided")
+    if not params.get("confirmed") and os.path.exists(path):
+        return confirm("write_file", f"File '{path}' already exists and will be overwritten. Resend with confirmed=true.")
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(content)
+        return ok("write_file", f"Written: {path}")
+    except Exception as e:
+        return fail("write_file", str(e))
+
+def handle_get_network_info(params):
+    addrs = {}
+    for iface, snics in psutil.net_if_addrs().items():
+        addrs[iface] = [{"family": str(s.family), "address": s.address} for s in snics]
+    stats = psutil.net_io_counters()
+    return ok("get_network_info", {
+        "interfaces": addrs,
+        "bytes_sent": stats.bytes_sent,
+        "bytes_recv": stats.bytes_recv,
+    })
+
+# ---------------------------------------------------------------------------
+# Dispatch table
+# ---------------------------------------------------------------------------
+
+HANDLERS = {
+    "get_cpu":          handle_get_cpu,
+    "get_ram":          handle_get_ram,
+    "get_disk":         handle_get_disk,
+    "get_system_info":  handle_get_system_info,
+    "list_processes":   handle_list_processes,
+    "kill_process":     handle_kill_process,
+    "run_command":      handle_run_command,
+    "open_app":         handle_open_app,
+    "list_directory":   handle_list_directory,
+    "read_file":        handle_read_file,
+    "write_file":       handle_write_file,
+    "get_network_info": handle_get_network_info,
+}
+
+# ---------------------------------------------------------------------------
+# Endpoint
+# ---------------------------------------------------------------------------
+
+@app.post("/task", response_model=Result)
+def execute_task(task: Task):
+    handler = HANDLERS.get(task.action)
+    if not handler:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown action '{task.action}'. Valid: {sorted(HANDLERS)}"
+        )
+    return handler(task.params)
+
+@app.get("/actions")
+def list_actions():
+    return {"actions": sorted(HANDLERS)}
+
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8765)
