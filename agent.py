@@ -236,14 +236,29 @@ def handle_read_file(params):
 def handle_write_file(params):
     path = params.get("path", "")
     content = params.get("content", "")
+    mode = params.get("mode", "write")  # "write" | "append" | "patch"
     full = _safe_path(path)
     if full is None:
         return fail("write_file", "Path must be inside the work directory")
-    if not params.get("confirmed"):
-        check = sandbox_exec(f"test -e {full!r} && echo EXISTS || echo NEW")
-        if "EXISTS" in check.stdout:
-            return confirm("write_file", f"File '{full}' already exists and will be overwritten. Resend with confirmed=true.")
+    if mode not in ("write", "append", "patch"):
+        return fail("write_file", f"Unknown mode '{mode}'. Use write, append, or patch.")
     try:
+        if mode == "append":
+            result = sandbox_exec(f"mkdir -p \"$(dirname {full!r})\" && cat >> {full!r}", stdin_data=content)
+            if result.returncode != 0:
+                return fail("write_file", result.stderr.strip() or "append failed")
+            return ok("write_file", f"Appended: {full}")
+        if mode == "patch":
+            # content must be a unified diff (diff -u / git diff format)
+            result = sandbox_exec(f"patch -u {full!r}", stdin_data=content)
+            if result.returncode != 0:
+                return fail("write_file", result.stderr.strip() or result.stdout.strip() or "patch failed")
+            return ok("write_file", f"Patched: {full}")
+        # mode == "write" — original behaviour, confirm before overwrite
+        if not params.get("confirmed"):
+            check = sandbox_exec(f"test -e {full!r} && echo EXISTS || echo NEW")
+            if "EXISTS" in check.stdout:
+                return confirm("write_file", f"File '{full}' already exists and will be overwritten. Resend with confirmed=true.")
         result = sandbox_exec(f"mkdir -p \"$(dirname {full!r})\" && cat > {full!r}", stdin_data=content)
         if result.returncode != 0:
             return fail("write_file", result.stderr.strip() or "write failed")
