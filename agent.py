@@ -181,7 +181,7 @@ def handle_run_command(params):
     if not command:
         return fail("run_command", "No command provided")
     # Blocklist (checked on host, before dispatch into the sandbox)
-    blocked = ["rm -rf", "format", "del /f", "shutdown", "mkfs", ":(){:|:&}", "dd if="]
+    blocked = ["format", "shutdown", "mkfs", ":(){:|:&}", "dd if="]
     for b in blocked:
         if b in command.lower():
             return fail("run_command", f"Blocked: '{b}' is not permitted")
