@@ -10,6 +10,7 @@ import subprocess
 import platform
 import psutil
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import Any
 import uvicorn
@@ -206,8 +207,14 @@ def handle_run_command(params):
     destructive = ["rmdir", "remove-item", "del ", "rd /"]
     if any(d in command.lower() for d in destructive) and not params.get("confirmed"):
         return confirm("run_command", f"Destructive command: '{command}'. Resend with confirmed=true.")
+    stream = params.get("stream", False)
+    timeout = params.get("timeout", 30)
+    if stream:
+        # Returns SSE stream — caller must hit /run_stream instead, but
+        # we return a sentinel here so the /task endpoint stays JSON-only.
+        return fail("run_command", "Use POST /run_stream for streaming execution")
     try:
-        result = sandbox_exec(command, timeout=params.get("timeout", 30))
+        result = sandbox_exec(command, timeout=timeout)
         return ok("run_command", {
             "stdout": redact(result.stdout.strip()),
             "stderr": redact(result.stderr.strip()),
@@ -234,14 +241,107 @@ def handle_read_file(params):
     full = _safe_path(path)
     if full is None:
         return fail("read_file", "Path must be inside the work directory")
-    max_bytes = params.get("max_bytes", 100_000)
+    line_start = params.get("line_start")
+    line_end = params.get("line_end")
     try:
-        result = sandbox_exec(f"head -c {int(max_bytes)} {full!r}")
+        if line_start or line_end:
+            # sed -n '100,200p' — zero-cost: reads only the requested slice
+            s = int(line_start or 1)
+            e = int(line_end or 999_999)
+            result = sandbox_exec(f"sed -n '{s},{e}p' {full!r}")
+        else:
+            max_bytes = params.get("max_bytes", 100_000)
+            result = sandbox_exec(f"head -c {int(max_bytes)} {full!r}")
         if result.returncode != 0:
             return fail("read_file", result.stderr.strip() or "read failed")
         return ok("read_file", {"path": full, "content": redact(result.stdout)})
     except Exception as e:
         return fail("read_file", str(e))
+
+def handle_stat_file(params):
+    path = params.get("path", "")
+    full = _safe_path(path)
+    if full is None:
+        return fail("stat_file", "Path must be inside the work directory")
+    try:
+        # Single exec: existence + size + line count + mtime
+        script = (
+            f"if [ -e {full!r} ]; then "
+            f"  wc -l {full!r} | awk '{{print $1}}'; "
+            f"  stat -c '%s %Y %F' {full!r}; "
+            f"else echo NOT_FOUND; fi"
+        )
+        result = sandbox_exec(script)
+        out = result.stdout.strip().splitlines()
+        if not out or out[0] == "NOT_FOUND":
+            return ok("stat_file", {"path": full, "exists": False})
+        lines = int(out[0])
+        size_bytes, mtime, ftype = out[1].split(" ", 2)
+        return ok("stat_file", {
+            "path": full,
+            "exists": True,
+            "size_bytes": int(size_bytes),
+            "line_count": lines,
+            "mtime": int(mtime),
+            "type": ftype,
+        })
+    except Exception as e:
+        return fail("stat_file", str(e))
+
+def handle_search_in_files(params):
+    pattern = params.get("pattern", "")
+    path = params.get("path", ".")
+    if not pattern:
+        return fail("search_in_files", "pattern is required")
+    full = _safe_path(path)
+    if full is None:
+        return fail("search_in_files", "Path must be inside the work directory")
+    flags = []
+    if params.get("ignore_case"):
+        flags.append("-i")
+    if params.get("fixed_string"):   # literal match, no regex
+        flags.append("-F")
+    include = params.get("include", "")  # e.g. "*.py"
+    include_flag = f"--include={include!r}" if include else ""
+    max_results = int(params.get("max_results", 200))
+    flag_str = " ".join(flags)
+    try:
+        result = sandbox_exec(
+            f"grep -rn {flag_str} {include_flag} -m {max_results} -- {pattern!r} {full!r} 2>&1 || true"
+        )
+        matches = result.stdout.strip().splitlines()
+        return ok("search_in_files", {
+            "pattern": pattern,
+            "path": full,
+            "match_count": len(matches),
+            "matches": matches,
+        })
+    except Exception as e:
+        return fail("search_in_files", str(e))
+
+def handle_git(params):
+    op = params.get("op", "")
+    ALLOWED_OPS = {"status", "diff", "log", "add", "commit", "push", "pull", "branch", "checkout"}
+    if op not in ALLOWED_OPS:
+        return fail("git", f"op must be one of: {sorted(ALLOWED_OPS)}")
+    # Build git command from op + optional args
+    extra = params.get("args", "")  # e.g. "-m 'fix bug'" for commit
+    git_cmd = f"git {op} {extra}".strip()
+    # commit and push are destructive-ish — require confirmation
+    if op in ("commit", "push") and not params.get("confirmed"):
+        return confirm("git", f"Will run: {git_cmd!r}. Resend with confirmed=true.")
+    try:
+        result = sandbox_exec(git_cmd, timeout=params.get("timeout", 30))
+        return ok("git", {
+            "op": op,
+            "stdout": result.stdout.strip(),
+            "stderr": result.stderr.strip(),
+            "returncode": result.returncode,
+        })
+    except subprocess.TimeoutExpired:
+        return fail("git", f"git {op} timed out")
+    except Exception as e:
+        return fail("git", str(e))
 
 def handle_write_file(params):
     path = params.get("path", "")
@@ -301,12 +401,15 @@ HANDLERS = {
     "run_command":      handle_run_command,
     "list_directory":   handle_list_directory,
     "read_file":        handle_read_file,
-    "write_file":       handle_write_file,
-    "get_network_info": handle_get_network_info,
+    "write_file":        handle_write_file,
+    "stat_file":         handle_stat_file,
+    "search_in_files":   handle_search_in_files,
+    "git":               handle_git,
+    "get_network_info":  handle_get_network_info,
 }
 
 # ---------------------------------------------------------------------------
-# Endpoint
+# Endpoints
 # ---------------------------------------------------------------------------
 
 @app.post("/task")
@@ -318,6 +421,40 @@ def execute_task(task: Task):
             detail=f"Unknown action '{task.action}'. Valid: {sorted(HANDLERS)}"
         )
     return handler(task.params)
+
+class StreamRequest(BaseModel):
+    command: str
+    timeout: int = 120
+
+@app.post("/run_stream")
+def run_stream(req: StreamRequest):
+    """Stream sandbox command output as SSE. Each line is 'data: <text>\n\n'.
+    Final line is 'data: [EXIT:<code>]\n\n'."""
+    blocked = ["format", "shutdown", "mkfs", ":(){:|:&}", "dd if="]
+    cmd = req.command.lower()
+    if hit := next((b for b in blocked if b in cmd), None):
+        raise HTTPException(400, f"Blocked: '{hit}' is not permitted")
+
+    def _stream():
+        docker_cmd = [
+            "docker", "exec", "-i", "-u", "coder", "-w", WORKDIR, SANDBOX,
+            "bash", "-lc", req.command,
+        ]
+        with subprocess.Popen(
+            docker_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, bufsize=1,
+        ) as proc:
+            try:
+                for line in proc.stdout:
+                    yield f"data: {redact(line.rstrip())}\n\n"
+                proc.wait(timeout=req.timeout)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                yield "data: [TIMEOUT]\n\n"
+                return
+        yield f"data: [EXIT:{proc.returncode}]\n\n"
+
+    return StreamingResponse(_stream(), media_type="text/event-stream")
 
 @app.get("/actions")
 def list_actions():
