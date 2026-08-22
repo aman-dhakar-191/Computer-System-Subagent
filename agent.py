@@ -9,7 +9,6 @@ import os
 import subprocess
 import platform
 import psutil
-import shutil
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import Any
@@ -45,18 +44,22 @@ def fail(operation: str, reason: str) -> dict:
 def confirm(operation: str, risk: str) -> dict:
     return {"status": "CONFIRMATION_REQUIRED", "operation": operation, "risk": risk}
 
-REDACT = {"password", "token", "secret", "key", "auth", "credential", "pass"}
+import re
+
+# Match lines where a secret keyword appears as an assignment/label, not mid-word.
+# e.g. "password=abc", "TOKEN: xyz", "secret_key = abc" → redacted
+# but "passed", "apikey.js", "Authorization: Bearer ..." → not redacted
+_REDACT_RE = re.compile(
+    r'(?<!\w)(password|token|secret|api_key|auth_key|credential|private_key)(?!\w)\s*[:=]',
+    re.IGNORECASE,
+)
 
 def redact(text: str) -> str:
     """Scrub likely secrets from command output."""
-    lines = []
-    for line in text.splitlines():
-        low = line.lower()
-        if any(k in low for k in REDACT):
-            lines.append("[REDACTED]")
-        else:
-            lines.append(line)
-    return "\n".join(lines)
+    return "\n".join(
+        "[REDACTED]" if _REDACT_RE.search(line) else line
+        for line in text.splitlines()
+    )
 
 # ---------------------------------------------------------------------------
 # Sandbox execution
