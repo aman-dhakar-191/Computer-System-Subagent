@@ -160,22 +160,36 @@ def handle_list_processes(params):
 def handle_kill_process(params):
     pid = params.get("pid")
     name = params.get("name")
+    # scope="host" (default): uses host psutil — same surface as list_processes.
+    # scope="sandbox": sends kill signal inside coder-sandbox via sandbox_exec.
+    scope = params.get("scope", "host")
+    if scope not in ("host", "sandbox"):
+        return fail("kill_process", "scope must be 'host' or 'sandbox'")
     if not pid and not name:
         return fail("kill_process", "Provide pid or name")
     if not params.get("confirmed"):
         target = f"PID {pid}" if pid else f"name={name}"
-        return confirm("kill_process", f"This will terminate process {target}. Resend with confirmed=true.")
+        return confirm("kill_process", f"This will terminate {target} on {scope}. Resend with confirmed=true.")
     try:
+        if scope == "sandbox":
+            if pid:
+                result = sandbox_exec(f"kill {int(pid)}")
+            else:
+                result = sandbox_exec(f"pkill -x {name!r}")
+            if result.returncode != 0:
+                return fail("kill_process", result.stderr.strip() or "kill failed")
+            return ok("kill_process", f"Terminated {('PID ' + str(pid)) if pid else ('name=' + name)} in sandbox")
+        # host scope
         if pid:
             psutil.Process(int(pid)).terminate()
-            return ok("kill_process", f"Terminated PID {pid}")
+            return ok("kill_process", f"Terminated host PID {pid}")
         else:
             killed = []
             for p in psutil.process_iter(["pid", "name"]):
                 if p.info["name"].lower() == name.lower():
                     p.terminate()
                     killed.append(p.info["pid"])
-            return ok("kill_process", f"Terminated PIDs: {killed}")
+            return ok("kill_process", f"Terminated host PIDs: {killed}")
     except Exception as e:
         return fail("kill_process", str(e))
 
