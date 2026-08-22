@@ -199,9 +199,9 @@ def handle_run_command(params):
         return fail("run_command", "No command provided")
     # Blocklist (checked on host, before dispatch into the sandbox)
     blocked = ["format", "shutdown", "mkfs", ":(){:|:&}", "dd if="]
-    for b in blocked:
-        if b in command.lower():
-            return fail("run_command", f"Blocked: '{b}' is not permitted")
+    cmd = command.lower()
+    if hit := next((b for b in blocked if b in cmd), None):
+        return fail("run_command", f"Blocked: '{hit}' is not permitted")
     # Destructive ops require confirmation
     destructive = ["rmdir", "remove-item", "del ", "rd /"]
     if any(d in command.lower() for d in destructive) and not params.get("confirmed"):
@@ -217,10 +217,6 @@ def handle_run_command(params):
         return fail("run_command", "Command timed out")
     except Exception as e:
         return fail("run_command", str(e))
-
-def handle_open_app(params):
-    # Not meaningful in a headless sandbox; fail cleanly.
-    return fail("open_app", "open_app is not supported in the sandbox environment")
 
 def handle_list_directory(params):
     path = params.get("path", ".")
@@ -303,7 +299,6 @@ HANDLERS = {
     "list_processes":   handle_list_processes,
     "kill_process":     handle_kill_process,
     "run_command":      handle_run_command,
-    "open_app":         handle_open_app,
     "list_directory":   handle_list_directory,
     "read_file":        handle_read_file,
     "write_file":       handle_write_file,
@@ -314,7 +309,7 @@ HANDLERS = {
 # Endpoint
 # ---------------------------------------------------------------------------
 
-@app.post("/task", response_model=Result)
+@app.post("/task")
 def execute_task(task: Task):
     handler = HANDLERS.get(task.action)
     if not handler:
