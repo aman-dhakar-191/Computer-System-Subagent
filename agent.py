@@ -1,6 +1,8 @@
 """
 Computer / System Subagent
 Receives structured tasks from n8n, executes them, returns SUCCESS/FAILED/CONFIRMATION_REQUIRED.
+Command execution and file operations run inside the Docker sandbox 'coder-sandbox',
+confined to the coder user's work directory. System-info reads (psutil) stay on the host.
 """
 
 import os
@@ -20,11 +22,11 @@ app = FastAPI(title="Computer System Subagent")
 # ---------------------------------------------------------------------------
 
 class Task(BaseModel):
-    action: str          # e.g. "get_cpu", "run_command", "open_app", ...
+    action: str
     params: dict[str, Any] = {}
 
 class Result(BaseModel):
-    status: str          # SUCCESS | FAILED | CONFIRMATION_REQUIRED
+    status: str
     operation: str
     result: Any = None
     reason: str = None
@@ -57,7 +59,43 @@ def redact(text: str) -> str:
     return "\n".join(lines)
 
 # ---------------------------------------------------------------------------
-# Handlers
+# Sandbox execution
+# ---------------------------------------------------------------------------
+
+SANDBOX = "coder-sandbox"
+WORKDIR = "/home/coder/work"
+
+def _safe_path(path: str) -> str | None:
+    """Resolve a user path under WORKDIR. Reject escapes. Returns container path or None."""
+    if not path:
+        return None
+    p = path.strip().lstrip("/")
+    if ".." in p.split("/"):
+        return None
+    full = os.path.normpath(os.path.join(WORKDIR, p))
+    if not (full == WORKDIR or full.startswith(WORKDIR + "/")):
+        return None
+    return full
+
+def sandbox_exec(command: str, timeout: int = 30, stdin_data: str = None):
+    """Run a shell command inside the sandbox container as coder, in WORKDIR."""
+    docker_cmd = [
+        "docker", "exec", "-i",
+        "-u", "coder",
+        "-w", WORKDIR,
+        SANDBOX,
+        "bash", "-lc", command,
+    ]
+    return subprocess.run(
+        docker_cmd,
+        input=stdin_data,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+
+# ---------------------------------------------------------------------------
+# Handlers  (system info = host via psutil; execution/files = sandbox)
 # ---------------------------------------------------------------------------
 
 def handle_get_cpu(params):
@@ -121,7 +159,6 @@ def handle_kill_process(params):
     name = params.get("name")
     if not pid and not name:
         return fail("kill_process", "Provide pid or name")
-    # require explicit confirm flag
     if not params.get("confirmed"):
         target = f"PID {pid}" if pid else f"name={name}"
         return confirm("kill_process", f"This will terminate process {target}. Resend with confirmed=true.")
@@ -143,7 +180,7 @@ def handle_run_command(params):
     command = params.get("command", "").strip()
     if not command:
         return fail("run_command", "No command provided")
-    # Blocklist
+    # Blocklist (checked on host, before dispatch into the sandbox)
     blocked = ["rm -rf", "format", "del /f", "shutdown", "mkfs", ":(){:|:&}", "dd if="]
     for b in blocked:
         if b in command.lower():
@@ -153,13 +190,7 @@ def handle_run_command(params):
     if any(d in command.lower() for d in destructive) and not params.get("confirmed"):
         return confirm("run_command", f"Destructive command: '{command}'. Resend with confirmed=true.")
     try:
-        result = subprocess.run(
-            command,
-            shell=True,
-            capture_output=True,
-            text=True,
-            timeout=params.get("timeout", 30),
-        )
+        result = sandbox_exec(command, timeout=params.get("timeout", 30))
         return ok("run_command", {
             "stdout": redact(result.stdout.strip()),
             "stderr": redact(result.stderr.strip()),
@@ -171,58 +202,49 @@ def handle_run_command(params):
         return fail("run_command", str(e))
 
 def handle_open_app(params):
-    path = params.get("path", "").strip()
-    if not path:
-        return fail("open_app", "No path provided")
-    try:
-        if platform.system() == "Windows":
-            os.startfile(path)
-        elif platform.system() == "Darwin":
-            subprocess.Popen(["open", path])
-        else:
-            subprocess.Popen(["xdg-open", path])
-        return ok("open_app", f"Launched: {path}")
-    except Exception as e:
-        return fail("open_app", str(e))
+    # Not meaningful in a headless sandbox; fail cleanly.
+    return fail("open_app", "open_app is not supported in the sandbox environment")
 
 def handle_list_directory(params):
     path = params.get("path", ".")
+    full = _safe_path(path)
+    if full is None:
+        return fail("list_directory", "Path must be inside the work directory")
     try:
-        entries = []
-        for entry in os.scandir(path):
-            entries.append({
-                "name": entry.name,
-                "is_file": entry.is_file(),
-                "is_dir": entry.is_dir(),
-                "size_bytes": entry.stat().st_size if entry.is_file() else None,
-            })
-        return ok("list_directory", {"path": path, "entries": entries})
+        result = sandbox_exec(f"ls -lAp --time-style=+ {full!r} 2>&1 || true")
+        return ok("list_directory", {"path": full, "listing": result.stdout.strip()})
     except Exception as e:
         return fail("list_directory", str(e))
 
 def handle_read_file(params):
     path = params.get("path", "")
-    if not path:
-        return fail("read_file", "No path provided")
+    full = _safe_path(path)
+    if full is None:
+        return fail("read_file", "Path must be inside the work directory")
     max_bytes = params.get("max_bytes", 100_000)
     try:
-        with open(path, "r", encoding="utf-8", errors="replace") as f:
-            content = f.read(max_bytes)
-        return ok("read_file", {"path": path, "content": redact(content)})
+        result = sandbox_exec(f"head -c {int(max_bytes)} {full!r}")
+        if result.returncode != 0:
+            return fail("read_file", result.stderr.strip() or "read failed")
+        return ok("read_file", {"path": full, "content": redact(result.stdout)})
     except Exception as e:
         return fail("read_file", str(e))
 
 def handle_write_file(params):
     path = params.get("path", "")
     content = params.get("content", "")
-    if not path:
-        return fail("write_file", "No path provided")
-    if not params.get("confirmed") and os.path.exists(path):
-        return confirm("write_file", f"File '{path}' already exists and will be overwritten. Resend with confirmed=true.")
+    full = _safe_path(path)
+    if full is None:
+        return fail("write_file", "Path must be inside the work directory")
+    if not params.get("confirmed"):
+        check = sandbox_exec(f"test -e {full!r} && echo EXISTS || echo NEW")
+        if "EXISTS" in check.stdout:
+            return confirm("write_file", f"File '{full}' already exists and will be overwritten. Resend with confirmed=true.")
     try:
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(content)
-        return ok("write_file", f"Written: {path}")
+        result = sandbox_exec(f"mkdir -p \"$(dirname {full!r})\" && cat > {full!r}", stdin_data=content)
+        if result.returncode != 0:
+            return fail("write_file", result.stderr.strip() or "write failed")
+        return ok("write_file", f"Written: {full}")
     except Exception as e:
         return fail("write_file", str(e))
 
