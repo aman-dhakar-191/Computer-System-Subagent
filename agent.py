@@ -365,6 +365,8 @@ def handle_write_file(params):
                 return fail("write_file", result.stderr.strip() or result.stdout.strip() or "patch failed")
             return ok("write_file", f"Patched: {full}")
         # mode == "write" — original behaviour, confirm before overwrite
+        if not content.strip():
+            return fail("write_file", "Refusing to write empty content. Use delete_file to remove a file.")
         if not params.get("confirmed"):
             check = sandbox_exec(f"test -e {full!r} && echo EXISTS || echo NEW")
             if "EXISTS" in check.stdout:
@@ -375,6 +377,24 @@ def handle_write_file(params):
         return ok("write_file", f"Written: {full}")
     except Exception as e:
         return fail("write_file", str(e))
+
+def handle_delete_file(params):
+    path = params.get("path", "")
+    full = _safe_path(path)
+    if full is None:
+        return fail("delete_file", "Path must be inside the work directory")
+    if not params.get("confirmed"):
+        check = sandbox_exec(f"test -e {full!r} && echo EXISTS || echo NEW")
+        if "NEW" in check.stdout:
+            return fail("delete_file", f"File '{full}' does not exist")
+        return confirm("delete_file", f"This will permanently delete '{full}'. Resend with confirmed=true.")
+    try:
+        result = sandbox_exec(f"rm -rf {full!r}")
+        if result.returncode != 0:
+            return fail("delete_file", result.stderr.strip() or "delete failed")
+        return ok("delete_file", f"Deleted: {full}")
+    except Exception as e:
+        return fail("delete_file", str(e))
 
 def handle_get_network_info(params):
     addrs = {}
@@ -402,6 +422,7 @@ HANDLERS = {
     "list_directory":   handle_list_directory,
     "read_file":        handle_read_file,
     "write_file":        handle_write_file,
+    "delete_file":       handle_delete_file,
     "stat_file":         handle_stat_file,
     "search_in_files":   handle_search_in_files,
     "git":               handle_git,
